@@ -1,16 +1,11 @@
 # AI Agent Workflow Builder
 
-A mini n8n for chaining AI agent steps, built on **nhost + Hasura + PostgreSQL + GraphQL + Next.js**.
+A mini n8n, scoped down to one idea: chain AI agent steps together, run them for real, and make sure two different orgs sharing the same database can never see or touch each other's data — even if someone tries to guess an ID.
 
-Users inside an organization build workflows out of ordered steps (`llm_call`, `http_request`, `db_write`, `notify`, `conditional_branch`, `approval_gate`), start them manually or via webhook, and watch execution stream live via GraphQL subscriptions. Every action is checked against two permission layers: org/role scoping (Hasura row-level permissions) and step-level gating (enforced in Action handlers).
+Built on **nhost + Hasura + PostgreSQL + GraphQL + Next.js**.
 
-**Note on the frontend:** functional, not polished. Every flow works end
-to end -- login, workflow builder, live run view with subscriptions,
-approval gate -- but the styling is minimal/default. Time went into the
-schema, permission layers, and Action-handler logic rather than UI design.
-
-**Live app:** `<add Vercel URL>`
-**GitHub repo:** `<add repo link>`
+**Live app:** [`website`](https://ai-agent-workflow-builder-node.vercel.app/login)
+**GitHub repo:** [`repo`](https://github.com/DeepakRoy58/AI-Agent-Workflow-Builder)
 
 **Test credentials:**
 | Org | Role | Email | Password |
@@ -19,27 +14,37 @@ schema, permission layers, and Action-handler logic rather than UI design.
 | Org A | editor | editorA@test.com | password123 |
 | Org B | owner | ownerB@test.com | password123 |
 
----
 
-## Table of Contents
+## The one design decision worth reading before anything else
 
-- [Tech Stack](#tech-stack)
-- [Architecture Overview](#architecture-overview)
-- [Prerequisites](#prerequisites)
-- [Local Setup](#local-setup)
-- [Environment Variables](#environment-variables)
-- [Database Schema](#database-schema)
-- [Permission Layers](#permission-layers)
-- [Hasura Actions](#hasura-actions)
-- [Triggers](#triggers)
-- [Running Locally](#running-locally)
-- [Deployment](#deployment)
-- [Testing Cross-Org Isolation](#testing-cross-org-isolation)
-- [Final Task Walkthrough](#final-task-walkthrough)
-- [Project Structure](#project-structure)
-- [Known Limitations / Stubs](#known-limitations--stubs)
+Workflow execution is **stateless and resumable**, and that single choice is why the rest of the codebase is smaller than it looks.
 
----
+`triggerWorkflowRun` doesn't just "start" a run — it's the *entire* execution engine. It steps through `workflow_steps` in order starting from position 0, updates `step_runs` as it goes, and either finishes or hits an `approval_gate` and stops. `approveStep` doesn't have separate resume logic; it calls the exact same execution loop, just starting one step later. A fresh run, a webhook-triggered run, and a paused-then-approved run are the same code path with a different starting index — not three different systems that all have to agree with each other.
+
+That's the thing to understand before diving into the schema or the permission tables below. Everything else in this README is in service of that one loop.
+
+
+## Two permission layers, and why one isn't enough
+
+Every request is checked twice, and deliberately in two different places:
+
+**Layer 1 — org/role scoping, enforced by Hasura itself.** Every table's row-level permission filters through a relationship chain back to `org_members`. A user querying a workflow that isn't theirs doesn't get an error — the row simply doesn't exist from their point of view. This is declarative, applied per-table (Hasura doesn't cascade permissions across relationships, so each of `workflows`, `workflow_steps`, `workflow_triggers`, `workflow_runs`, and `step_runs` has its own rule), and it's what makes cross-org isolation hold even against a raw GraphQL query with a guessed UUID.
+
+**Layer 2 — step-level gating, enforced in code.** Some actions can't be expressed as a row filter because they depend on *what* is being written, not just *who's* writing it. Creating a `db_write`, `webhook`, or `notify` step requires the `owner` role specifically — checked inside the `upsertWorkflowStep` Action handler, before the insert happens, because Hasura's permission DSL can't branch on a JSONB `type` field at insert time. Approving an `approval_gate` requires `owner` or `editor` — checked inside `approveStep`, because that's a mid-execution state transition, not a plain read or write, and needs to happen *before* the run is allowed to resume.
+
+Short version: if a rule can be expressed as "which rows can this role see," it lives in Hasura. If it depends on branching logic mid-action, it lives in a handler. Mixing those up is where most permission bugs in Hasura projects come from.
+
+
+## What's real vs. what's a placeholder
+
+Being upfront about this rather than burying it in a checklist at the bottom:
+
+- **LLM calls:** `<real / stubbed with artificial delay — state which and why>`
+- **Triggers implemented:** manual + webhook (the assignment only requires one beyond manual). Scheduled and DB-event triggers are **not** built — noted here rather than left to be discovered.
+- **Frontend:** every flow works end to end (login → build a workflow → run it → watch it stream live → approve a gate → see it resume and complete) but styling is default/unstyled throughout. Time went into the schema, the two permission layers, and the Action-handler logic instead of a design pass.
+- **Step config editing** is a raw JSON textarea, not per-type forms. Step reordering is up/down buttons, not drag-and-drop.
+- **New user roles aren't set automatically on signup** — each test user needs `default_role` and a matching `auth.user_roles` row set by hand (step 7 below). A real version would do this with an Auth hook.
+
 
 ## Tech Stack
 
@@ -48,103 +53,52 @@ schema, permission layers, and Action-handler logic rather than UI design.
 | Database | PostgreSQL (via nhost) |
 | API layer | Hasura GraphQL Engine |
 | Auth | nhost Auth |
-| Serverless functions | nhost Functions (Hasura Actions handlers) |
+| Serverless functions | nhost Functions (Hasura Action handlers) |
 | Frontend | Next.js (React) |
-| LLM calls | [Groq / OpenRouter / Gemini — fill in which one you used] |
+| LLM calls | `[Groq / OpenRouter / Gemini — fill in which one you used]` |
 | Hosting (frontend) | Vercel |
 | Hosting (backend) | nhost Cloud |
 
----
 
-## Architecture Overview
+<img width="1324" height="552" alt="image" src="https://github.com/user-attachments/assets/00eccfcc-aa0f-4cd7-9a3d-ff3133e1e624" />
 
 
-Execution is **stateless and resumable**: `triggerWorkflowRun` runs steps in order starting at position 0; `approveStep` re-invokes the same execution logic starting from the step *after* the approved gate. This means pause/resume, retries, and webhook-triggered runs all share one code path instead of three.
+## Setup — cloud-first, because that's how this was actually built
 
----
+Local Docker (`nhost up`) does work and the steps are the same once it's running, but this project was built and tested against nhost Cloud directly, because schema/permission iteration in the cloud dashboard was faster and more reliable than fighting the CLI's expected folder structure. If you want the local path, see the [Optional: local Docker](#optional-local-docker-instead-of-cloud) note at the end of this section — otherwise, follow this as written.
 
-## Prerequisites
-
-- Node.js 20 (Node 22+ currently breaks Next.js 14's dev-server TypeScript
-  check with an unrelated internal error -- see [Known Limitations](#known-limitations--stubs))
-- A free nhost Cloud project (this build was done entirely against nhost
-  Cloud, not local Docker -- see note below)
-- A Vercel account (for frontend deploy)
-- An LLM API key (Groq/OpenRouter/Gemini free tier) — **or** leave `LLM_STUBBED=true` to use a stubbed call with an artificial delay (see [Known Limitations](#known-limitations--stubs))
-
-**Note on local vs cloud development:** this project was built and tested
-directly against an nhost Cloud project rather than the local Docker
-environment (`nhost up`). Local Docker setup did work (see the CLI
-commands below if you want to try it), but schema, permissions, and
-testing were all done in the cloud dashboard, which turned out to be more
-reliable for a first pass. Both approaches are supported; the setup steps
-below reflect the cloud path actually used for this submission.
-
----
-
-## Setup (cloud-first, as actually built)
-
+**1. Clone the repo**
 ```bash
-# 1. Clone the repo
 git clone <your-repo-url>
 cd ai-agent-workflow-builder
 ```
 
-**2. Create an nhost Cloud project** at [nhost.io](https://nhost.io) --
-sign up, create a new project, note its subdomain and region (shown on the
-project's Settings > Environment Variables page as `NHOST_SUBDOMAIN` /
-`NHOST_REGION`).
+**2. Create an nhost Cloud project** at [nhost.io](https://nhost.io). Note the subdomain and region from **Settings → Environment Variables** — you'll need both for the frontend env file.
 
-**3. Load the schema.** Open the project's dashboard, go to
-**Database > Table Editor & Browser > SQL Editor**, paste the full
-contents of `migrations/001_init.sql`, and run it. Confirm all 7 tables
-plus the `org_usage_this_month` view appear in the table list.
+**3. Load the schema.** In the dashboard: **Database → SQL Editor**, paste the full contents of `migrations/001_init.sql`, run it. Confirm 7 tables plus the `org_usage_this_month` view show up.
 
-**4. Set up relationships.** For each table with a foreign key
-(`org_members`, `workflows`, `workflow_steps`, `workflow_triggers`,
-`workflow_runs`, `step_runs`), click the table's "..." menu > **Edit
-Relationships**, and add every suggested relationship shown. Hasura
-auto-detects these from the foreign keys in the schema.
+**4. Wire up relationships.** For each table with a foreign key (`org_members`, `workflows`, `workflow_steps`, `workflow_triggers`, `workflow_runs`, `step_runs`): table's "..." menu → **Edit Relationships** → add every suggested relationship. Hasura detects these from the FKs automatically.
 
-**5. Add custom roles.** Hasura's default roles (`admin`, `user`,
-`public`, etc.) don't include this project's roles. Open any table's
-"..." menu > **Edit Permissions** > click **"Settings page"** in the blue
-banner > **"+ Create Allowed Role"** > add `owner`, `editor`, `viewer`.
+**5. Add the three custom roles.** Hasura ships with `admin`/`user`/`public`, none of which this schema uses. On any table: "..." → **Edit Permissions** → **Settings page** (blue banner) → **+ Create Allowed Role** → add `owner`, `editor`, `viewer`.
 
-**6. Set permissions on every table.** For each table, for each of the
-three roles, add a `select` permission with **"With custom check"**, using
-the **JSON** editor mode (faster and less error-prone than the visual
-query builder for nested relationships). See [Permission
-Layers](#permission-layers) below for the exact filters -- they chain
-through each table's relationship back to `org_members`. Remember to
-check **"Select All"** on columns before saving each permission.
+**6. Set permissions, table by table, role by role.** Use **"With custom check"** in **JSON** editor mode — genuinely faster than the visual builder once relationships get nested. The exact filters are in [Permission Layers](#two-permission-layers-and-why-one-isnt-enough) above; they all chain back to `org_members`. Don't forget **"Select All"** on columns before saving each one — it's not the default.
 
-**7. Create test users.** Dashboard > **Auth > Users** > create users with
-email/password (e.g. `ownerA@test.com` / `password123`). New users need
-`email_verified = true` to log in -- either toggle it in the user's detail
-panel, or run in SQL Editor:
+**7. Create test users.** **Auth → Users** → add each with email/password. Two things Hasura doesn't do for you on signup, both required before login works:
+
 ```sql
+-- email must be verified
 update auth.users set email_verified = true where email = 'ownerA@test.com';
-```
-Each user also needs a `default_role` matching their intended app role
-(Hasura's default role for new sign-ups is `user`, which has no
-permissions in this schema):
-```sql
+
+-- default_role must match the app role — new signups get 'user', which has zero permissions here
 update auth.users set default_role = 'owner' where email = 'ownerA@test.com';
 insert into auth.user_roles (user_id, role)
 select id, 'owner' from auth.users where email = 'ownerA@test.com'
 on conflict do nothing;
 ```
 
-**8. Seed org data.** Fill in the real user UUIDs (from `select id, email
-from auth.users;`) into `seed/seed.sql`'s placeholders, then run the whole
-file in SQL Editor. This creates two orgs, memberships, and one sample
-workflow.
+**8. Seed the orgs.** Grab real UUIDs with `select id, email from auth.users;`, drop them into `seed/seed.sql`'s placeholders, run the whole file. This creates two orgs, their memberships, and one sample workflow.
 
-**9. Add CORS origins.** Dashboard > **Settings > General** (or wherever
-your dashboard version places it) -- add `http://localhost:3000` and
-later your Vercel URL to the allowed origins, or the frontend's requests
-will be silently blocked by the browser.
+**9. Add CORS origins.** **Settings → General** → add `http://localhost:3000`, and later your Vercel URL. Skip this and every frontend request gets silently blocked by the browser with no obvious error.
 
 **10. Run the frontend:**
 ```bash
@@ -152,7 +106,7 @@ cd frontend
 npm install
 cp .env.example .env.local
 ```
-Edit `.env.local` to use your actual cloud values, not `local`:
+Edit `.env.local` with your real cloud values (not `local`):
 ```
 NEXT_PUBLIC_NHOST_SUBDOMAIN=your-subdomain
 NEXT_PUBLIC_NHOST_REGION=your-region
@@ -160,208 +114,133 @@ NEXT_PUBLIC_NHOST_REGION=your-region
 ```bash
 npm run dev
 ```
+Live at `http://localhost:3000`.
 
-Frontend will be live at `http://localhost:3000`.
-
-### Optional: local Docker environment instead of cloud
+### Optional: local Docker instead of cloud
 
 ```bash
 npm install -g nhost-cli
 nhost init      # only if not already initialized
-nhost up        # spins up Postgres + Hasura + Auth in Docker
+nhost up        # Postgres + Hasura + Auth in Docker
 ```
-This prints local URLs (Hasura console, GraphQL endpoint, Auth endpoint).
-From here the same migration/permission/seed steps apply, run against the
-local dashboard instead of the cloud one. Note: the CLI's own migration/
-metadata-apply commands (`nhost hasura migrate apply`, `nhost hasura
-metadata apply`) expect a specific nhost folder structure
-(`nhost/migrations/<timestamp>_name/`) that this repo's flatter
-`migrations/` and `metadata/` folders don't match out of the box --
-pasting the SQL/permissions through the dashboard UI (as described above)
-sidesteps that entirely and is what was actually used.
+Same migration/permission/seed steps apply against the local dashboard. One gotcha: the CLI's own `nhost hasura migrate apply` / `nhost hasura metadata apply` expect an `nhost/migrations/<timestamp>_name/` layout that this repo's flatter `migrations/`/`metadata/` folders don't match — pasting SQL and permissions through the dashboard UI sidesteps that entirely, which is why that's the documented path above.
 
----
 
 ## Environment Variables
 
 **`frontend/.env.local`**
-
 ```bash
-NEXT_PUBLIC_NHOST_SUBDOMAIN=your-subdomain   # from nhost dashboard > Settings > Environment Variables
+NEXT_PUBLIC_NHOST_SUBDOMAIN=your-subdomain   # dashboard > Settings > Environment Variables
 NEXT_PUBLIC_NHOST_REGION=your-region         # e.g. ap-south-1
 ```
+Use `local` for both if pointed at Docker instead of cloud.
 
-If pointed at a local Docker environment instead, use `local` for both.
-
-**nhost Functions / Actions secrets** (set via `nhost secrets set` or the nhost dashboard, not committed):
-
+**nhost Functions / Actions secrets** (set via `nhost secrets set` or the dashboard — never committed):
 ```bash
-LLM_API_KEY=<your key>              # Groq/OpenRouter/Gemini key
-LLM_STUBBED=false                   # set true to skip real calls
-WEBHOOK_SHARED_SECRET=<random string>  # validates inbound webhook trigger calls
+LLM_API_KEY=<your key>                 # Groq/OpenRouter/Gemini
+LLM_STUBBED=false                      # true skips real calls, adds artificial delay instead
+WEBHOOK_SHARED_SECRET=<random string>  # validates inbound webhook-trigger calls
 HASURA_ADMIN_SECRET=<from nhost project settings>
 HASURA_GRAPHQL_ENDPOINT=<your hasura endpoint>/v1/graphql
 ```
 
----
 
 ## Database Schema
 
-Core tables (full DDL in `migrations/`):
+Full DDL in `migrations/`. The relationship chain is `organizations → org_members → workflows → workflow_steps/workflow_triggers`, and separately `workflows → workflow_runs → step_runs`.
 
-- **organizations** — `id, name, quota_limit, quota_used, quota_period_start`
-- **org_members** — `id, org_id, user_id, role (owner|editor|viewer)`
-- **workflows** — `id, org_id, name, created_by`
-- **workflow_steps** — `id, workflow_id, step_order, type, config (jsonb)`
-- **workflow_triggers** — `id, workflow_id, type (manual|webhook|scheduled|db_event), config (jsonb)`
-- **workflow_runs** — `id, workflow_id, status (pending|running|paused|completed|failed), started_at, finished_at, triggered_by, trigger_type`
-- **step_runs** — `id, workflow_run_id, workflow_step_id, status, input, output, error, attempt_count, approved_by, approved_at`
-
-Relationship chain: `organizations → org_members → workflows → workflow_steps/workflow_triggers`, and `workflows → workflow_runs → step_runs`.
-
-An aggregation view exposes org-level usage:
+| Table | Purpose |
+|---|---|
+| `organizations` | `id, name, quota_limit, quota_used, quota_period_start` |
+| `org_members` | `id, org_id, user_id, role (owner\|editor\|viewer)` — the table everything else's permissions chain back to |
+| `workflows` | `id, org_id, name, created_by` |
+| `workflow_steps` | `id, workflow_id, step_order, type, config (jsonb)` |
+| `workflow_triggers` | `id, workflow_id, type (manual\|webhook\|scheduled\|db_event), config (jsonb)` |
+| `workflow_runs` | `id, workflow_id, status (pending\|running\|paused\|completed\|failed), started_at, finished_at, triggered_by, trigger_type` |
+| `step_runs` | `id, workflow_run_id, workflow_step_id, status, input, output, error, attempt_count, approved_by, approved_at` |
 
 ```sql
+-- exposed as a computed/read-only table so it's queryable via GraphQL
 create view org_usage_this_month as
-select org_id, count(*) as runs_this_month, avg(extract(epoch from (finished_at - started_at))) as avg_duration_seconds
+select org_id, count(*) as runs_this_month,
+       avg(extract(epoch from (finished_at - started_at))) as avg_duration_seconds
 from workflow_runs
 where started_at >= date_trunc('month', now())
 group by org_id;
 ```
 
-Tracked in Hasura as a computed field / read-only table so it's queryable via GraphQL.
-
----
-
-## Permission Layers
-
-### Layer 1 — Org + role scoping (Hasura row-level permissions)
-
-Declared per-table in Hasura metadata (`metadata/databases/default/tables/*.yaml`). Every table's `select`/`insert`/`update` permission filters through a relationship to `org_members`:
-
-```yaml
-# example: workflows select permission for role "editor"
-filter:
-  org:
-    members:
-      _and:
-        - user_id: { _eq: X-Hasura-User-Id }
-```
-
-This guarantees a user only ever sees/touches rows in orgs they belong to — regardless of role, and regardless of guessing another org's row ID (the filter makes non-member rows simply not exist from that user's point of view; Hasura returns an empty result, not an error).
-
-Applied identically across `workflows`, `workflow_steps`, `workflow_triggers`, `workflow_runs`, `step_runs`, each with its own rule since Hasura permissions don't cascade automatically.
-
-### Layer 2 — Step-level gating (enforced in code, not Hasura permissions)
-
-Some step types reach outside the sandbox and can't be safely gated by a declarative row filter alone:
-
-- Creating a `db_write`, `webhook` trigger, or `notify` step requires `owner` role — checked inside the `upsertWorkflowStep` Action handler before the insert happens.
-- Approving an `approval_gate` requires the approver's `org_members.role` to be `owner` or `editor` — checked inside the `approveStep` Action handler before the run is resumed, because this is a mid-execution state transition, not a plain row read/write.
-
-This is intentional: Hasura's declarative permission DSL can't easily branch conditionally on a JSONB/enum field value at insert time, so both of these checks live in application code where they're testable and auditable.
-
----
 
 ## Hasura Actions
 
-### `triggerWorkflowRun(workflow_id: uuid!)`
-
-1. Verifies caller is `owner`/`editor` in the workflow's org (queries `org_members` directly inside the handler — Actions execute with admin secret, so they must re-check auth themselves).
-2. Checks `organizations.quota_used < quota_limit`; rejects with an error if exhausted.
+**`triggerWorkflowRun(workflow_id: uuid!)`** — this is the execution engine described above.
+1. Re-checks the caller's role in `org_members` directly (Actions run with the admin secret, so auth is never inherited — it has to be re-verified inside the handler).
+2. Checks `organizations.quota_used < quota_limit`; rejects if exhausted.
 3. Inserts a `workflow_runs` row (`status = running`).
-4. Executes `workflow_steps` in `step_order`, updating the corresponding `step_runs` row before/after each step so the frontend subscription reflects progress live:
-   - `llm_call` / `http_request`: real external call, wrapped in try/catch, **one retry on failure** with a short backoff.
-   - `conditional_branch`: reads the previous step's `output`, decides which step index executes next.
-   - `approval_gate`: sets `step_runs.status = paused_awaiting_approval` and `workflow_runs.status = paused`, then returns — execution stops here until approved.
-5. On completing all steps: increments `organizations.quota_used`, sets `workflow_runs.status = completed`.
+4. Walks `workflow_steps` in `step_order`, updating `step_runs` before/after each step so the live subscription reflects real progress:
+   - `llm_call` / `http_request` — real external call, try/catch, one retry with backoff on failure.
+   - `conditional_branch` — reads the previous step's `output`, picks the next step index.
+   - `approval_gate` — sets `step_runs.status = paused_awaiting_approval` and `workflow_runs.status = paused`, then returns. Execution stops here until someone approves.
+5. On finishing all steps: increments `quota_used`, sets `workflow_runs.status = completed`.
 
-### `approveStep(step_run_id: uuid!)`
-
+**`approveStep(step_run_id: uuid!)`**
 1. Resolves `step_run → workflow_run → workflow → org`.
-2. Checks caller's role in that org is `owner`/`editor`.
+2. Confirms caller's role in that org is `owner`/`editor`.
 3. Sets `approved_by`, `approved_at`, flips status back to `running`.
-4. Re-invokes the same execution loop starting immediately after the approved step, until completion or the next `approval_gate`.
+4. Re-invokes the same execution loop starting right after the approved step.
 
-### `upsertWorkflowStep(...)`
-
-Handles Layer 2 gating for step creation (see above) before writing to `workflow_steps`.
-
----
+**`upsertWorkflowStep(...)`** — where Layer 2's create-time role check actually lives (see above).
 
 ## Triggers
 
-| Type | How it's wired |
+| Type | Status |
 |---|---|
-| **Manual** | Frontend calls `triggerWorkflowRun` directly, gated behind role check in UI (button hidden for viewers) *and* re-checked server-side. |
-| **Webhook** | `triggerWorkflowRun` is itself exposed as an HTTP Action endpoint. External callers hit it with a shared secret header instead of a user JWT; the handler validates the secret in place of the normal auth check. |
-| **Scheduled** | [Implemented / Stubbed — state which] via nhost scheduled function on a cron expression from `workflow_triggers.config`. |
-| **Database event** | [Implemented / Stubbed — state which] via a Hasura Event Trigger on the watched table, calling `triggerWorkflowRun` on insert/update. |
+| **Manual** | Frontend calls `triggerWorkflowRun` directly; button hidden for viewers in the UI *and* the role check is re-run server-side regardless. |
+| **Webhook** | `triggerWorkflowRun` is also exposed as an HTTP endpoint. External callers authenticate with a shared secret header instead of a user JWT — the handler swaps in secret validation in place of the normal role check. |
+| **Scheduled** | `[Implemented / Stubbed — state which]` |
+| **Database event** | `[Implemented / Stubbed — state which]` |
 
-> Fill in the bracketed lines above with what you actually built — the assignment only requires manual + one other, so it's fine if scheduled/db_event are noted as not implemented due to time.
+Manual + webhook satisfies the assignment's "one trigger beyond manual" requirement on its own, so scheduled/DB-event were left out rather than rushed.
 
----
+## Smoke Test (local)
 
-## Running Locally — Quick Smoke Test
-
-```bash
-# With nhost up + frontend dev server running:
-
-# 1. Log in as seeded Org A owner in the UI
-# 2. Create a workflow with llm_call -> conditional_branch -> approval_gate -> http_request
-# 3. Click Run — watch step_runs update live via subscription
-# 4. When it pauses at approval_gate, click Approve (as Org A owner/editor)
-# 5. Confirm it resumes and completes
 ```
-
----
+1. Log in as seeded Org A owner
+2. Build: llm_call -> conditional_branch -> approval_gate -> http_request
+3. Run it — watch step_runs update live via subscription
+4. When it pauses at approval_gate, approve as Org A owner/editor
+5. Confirm it resumes and completes
+```
 
 ## Deployment
 
-### Backend (nhost Cloud)
+**Backend** — already live the moment the nhost Cloud project is configured; there's no separate deploy step since schema/permissions/Actions were built directly against the live project.
 
-The backend is already the nhost Cloud project set up in [Setup](#setup-cloud-first-as-actually-built)
-above -- there's no separate "deploy" step for schema/permissions/Actions,
-since everything was built directly against the live cloud project via its
-dashboard. It's reachable at its GraphQL/Auth URLs the moment it's
-configured.
-
-### Frontend (Vercel)
-
-1. Push this repo to GitHub.
-2. Import the repo in Vercel, set the **root directory** to `frontend/`.
-3. Add environment variables in Vercel project settings: `NEXT_PUBLIC_NHOST_SUBDOMAIN`, `NEXT_PUBLIC_NHOST_REGION` (the real cloud values).
-4. Deploy. Vercel provides a live URL.
-5. **Add the Vercel URL to nhost's CORS allowed origins** (dashboard > Settings > General) -- without this, the deployed frontend's requests will be blocked by the browser exactly like local requests are blocked without `http://localhost:3000` allowed.
-6. Smoke-test the live URL end-to-end before recording the demo.
-
----
+**Frontend (Vercel):**
+1. Push to GitHub.
+2. Import in Vercel, set root directory to `frontend/`.
+3. Add `NEXT_PUBLIC_NHOST_SUBDOMAIN` / `NEXT_PUBLIC_NHOST_REGION` (real cloud values) in project settings.
+4. Deploy.
+5. Add the resulting Vercel URL to nhost's CORS allowed origins — same failure mode as skipping `localhost:3000` locally, just harder to debug in prod.
+6. Smoke-test the live URL end to end before recording the demo.
 
 ## Testing Cross-Org Isolation
 
-This is explicitly graded, so verify it directly rather than assuming Layer 1 works:
+This is graded directly, so verify it rather than trust that Layer 1 works:
 
 1. Log in as an Org B user.
-2. In GraphQL Playground (or the app's network tab), manually query/mutate using an Org A `workflow_id` or `step_run_id` copied from Org A's session.
-3. Confirm: `select` returns an empty result (not an error, not data), `insert`/`update`/the `approveStep`/`triggerWorkflowRun` Actions all reject with an authorization error.
-4. Repeat for at least one guessed/copied ID per table (`workflows`, `workflow_runs`, `step_runs`).
-
----
-
+2. In GraphQL Playground (or the app's network tab), query/mutate using an Org A `workflow_id` or `step_run_id` copied from an Org A session.
+3. Confirm: `select` returns an empty result — not an error, not data. `insert`/`update`/`approveStep`/`triggerWorkflowRun` all reject with an authorization error.
+4. Repeat for at least one guessed ID per table (`workflows`, `workflow_runs`, `step_runs`).
+5. 
 ## Final Task Walkthrough
 
-Matches the assignment's required live scenario:
+1. Org A and Org B both exist, each with their own seeded users/roles.
+2. Org A owner builds `llm_call → conditional_branch → http_request`, branch outcome depending on the LLM's output.
+3. Run manually — confirm live status streams via subscription.
+4. Trigger again via the webhook endpoint (curl/Postman) — confirm a second run starts with zero UI interaction.
+5. Add an `approval_gate`; run again; confirm it pauses; approve as Org A owner; confirm it resumes and completes.
+6. Log in as an Org B user; attempt to view/trigger/approve anything belonging to Org A, including by guessed ID — confirm every attempt fails per [Testing Cross-Org Isolation](#testing-cross-org-isolation).
 
-1. Two orgs (A, B) exist, each with their own seeded users/roles.
-2. Org A owner builds a workflow: `llm_call → conditional_branch → http_request`, with the branch outcome depending on the LLM's output.
-3. Run it manually — confirm live status streams via subscription.
-4. Trigger it again via the webhook endpoint (curl or Postman) — confirm a second run starts without any button click.
-5. Add an `approval_gate` step; run again; confirm it pauses; approve as Org A owner; confirm it resumes and completes.
-6. Log in as an Org B user; attempt to view/trigger/approve anything belonging to Org A, including by ID — confirm all attempts fail per [Testing Cross-Org Isolation](#testing-cross-org-isolation).
-
-A recording of this sequence is in `/demo/final-task.mp4` (or linked here: `<link>`).
-
----
 
 ## Project Structure
 
@@ -378,35 +257,19 @@ A recording of this sequence is in `/demo/final-task.mp4` (or linked here: `<lin
 ├── migrations/                 # SQL schema migrations
 ├── metadata/                   # Hasura metadata (tables, relationships, permissions, actions)
 ├── seed/
-│   └── seed.sql                # two orgs, users, roles for local testing
+│   └── seed.sql                # two orgs, users, roles
 ├── demo/
 │   └── final-task.mp4
 └── README.md
 ```
 
----
+## Environment gotchas worth knowing before you hit them
 
-## Known Limitations / Stubs
-
-- [ ] LLM calls: `<real / stubbed with artificial delay — state which and why>`
-- [ ] Scheduled trigger: not implemented (manual + webhook satisfy the "trigger beyond manual" requirement on their own)
-- [ ] DB event trigger: not implemented, same reasoning
-- [ ] Step reordering UI: up/down buttons, not drag-and-drop
-- [ ] Step config: raw JSON textarea rather than per-type forms
-- [ ] **Frontend visual polish**: functional but plain -- default form styling throughout, no design pass. Every flow (login, workflow builder, run view with live subscription, approval) works end to end; time went into the schema, permission layers, and Action-handler logic instead.
-- [ ] Node 22+ crashes Next.js 14's dev server with an unrelated internal
-      TypeScript-verification error (`Cannot read properties of undefined
-      (reading 'endsWith')`). Use Node 20. Also note: declaring
-      `typescript`/`@types/react`/`@types/node` as explicit devDependencies
-      (rather than letting Next.js auto-install them on first run) avoids a
-      separate, unrelated crash in that auto-install path.
-- [ ] New users' Hasura role isn't set automatically on signup in this
-      build -- each test user needs `default_role` and a matching
-      `auth.user_roles` row set manually (see setup step 7). A production
-      version would set this via an Auth hook on signup instead.
+- **Node 22+ breaks Next.js 14's dev server** with an unrelated internal TypeScript-check error (`Cannot read properties of undefined (reading 'endsWith')`). Use Node 20.
+- Declaring `typescript` / `@types/react` / `@types/node` as explicit devDependencies (rather than letting Next.js auto-install them on first run) avoids a separate crash in that auto-install path.
 
 ---
 
-## Write-up (schema reasoning, permission enforcement, approval-gate flow)
+## Write-up
 
-See `WRITEUP.md` for the required ~1 page write-up covering schema design decisions, how the two permission layers differ in enforcement mechanism, and the pause/resume implementation for `approval_gate`.
+`WRITEUP.md` covers the schema reasoning, how the two permission layers differ in enforcement mechanism, and the pause/resume implementation for `approval_gate` in more depth than fits here.
