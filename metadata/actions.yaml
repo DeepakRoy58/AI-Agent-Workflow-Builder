@@ -1,0 +1,70 @@
+actions:
+  - name: triggerWorkflowRun
+    definition:
+      kind: synchronous
+      handler: "{{FUNCTIONS_BASE_URL}}/triggerWorkflowRun"
+      forward_client_headers: true
+      headers:
+        - name: x-hasura-admin-secret
+          value_from_env: HASURA_ADMIN_SECRET
+    permissions:
+      - role: owner
+      - role: editor
+      # note: webhook calls bypass Hasura auth entirely and hit the function's
+      # HTTP endpoint directly with x-webhook-secret — see README "Triggers"
+
+  - name: approveStep
+    definition:
+      kind: synchronous
+      handler: "{{FUNCTIONS_BASE_URL}}/approveStep"
+      forward_client_headers: true
+    permissions:
+      - role: owner
+      - role: editor
+
+  - name: upsertWorkflowStep
+    definition:
+      kind: synchronous
+      handler: "{{FUNCTIONS_BASE_URL}}/upsertWorkflowStep"
+      forward_client_headers: true
+    permissions:
+      - role: owner
+      - role: editor
+
+custom_types:
+  input_objects:
+    - name: TriggerWorkflowRunInput
+      fields:
+        - name: workflow_id
+          type: uuid!
+    - name: ApproveStepInput
+      fields:
+        - name: step_run_id
+          type: uuid!
+    - name: UpsertWorkflowStepInput
+      fields:
+        - name: id
+          type: uuid
+        - name: workflow_id
+          type: uuid!
+        - name: step_order
+          type: Int!
+        - name: type
+          type: String!
+        - name: config
+          type: jsonb!
+  objects:
+    - name: TriggerWorkflowRunOutput
+      fields:
+        - name: workflow_run_id
+          type: uuid!
+        - name: status
+          type: String!
+    - name: ApproveStepOutput
+      fields:
+        - name: status
+          type: String!
+    - name: UpsertWorkflowStepOutput
+      fields:
+        - name: id
+          type: uuid!

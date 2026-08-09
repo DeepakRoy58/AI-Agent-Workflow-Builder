@@ -1,0 +1,132 @@
+# Layer 1 permissions — every table scopes through org_members via a
+# relationship, so role alone is never enough: a user must also be a member
+# of the row's org. Applies uniformly across owner/editor/viewer; only the
+# allowed mutation root fields differ per role.
+#
+# Relationship note: org_members, workflows, workflow_steps, workflow_triggers,
+# workflow_runs, step_runs all define an `org` (or nested) object relationship
+# used below. Set these up in the Hasura console under each table's
+# Relationships tab before applying permissions, or track them in this same
+# metadata tree under `relationships:` per table.
+
+- table:
+    schema: public
+    name: organizations
+  select_permissions:
+    - role: owner
+      permission:
+        columns: ["id","name","quota_limit","quota_used","quota_period_start","created_at"]
+        filter: { members: { user_id: { _eq: "X-Hasura-User-Id" } } }
+    - role: editor
+      permission:
+        columns: ["id","name","quota_limit","quota_used","quota_period_start","created_at"]
+        filter: { members: { user_id: { _eq: "X-Hasura-User-Id" } } }
+    - role: viewer
+      permission:
+        columns: ["id","name","quota_limit","quota_used","quota_period_start","created_at"]
+        filter: { members: { user_id: { _eq: "X-Hasura-User-Id" } } }
+
+- table:
+    schema: public
+    name: org_members
+  select_permissions:
+    - role: owner
+      permission:
+        columns: "*"
+        filter: { org: { members: { user_id: { _eq: "X-Hasura-User-Id" } } } }
+    - role: editor
+      permission:
+        columns: "*"
+        filter: { org: { members: { user_id: { _eq: "X-Hasura-User-Id" } } } }
+    - role: viewer
+      permission:
+        columns: "*"
+        filter: { org: { members: { user_id: { _eq: "X-Hasura-User-Id" } } } }
+  insert_permissions:
+    # only owners manage membership
+    - role: owner
+      permission:
+        check: { org: { members: { user_id: { _eq: "X-Hasura-User-Id" }, role: { _eq: "owner" } } } }
+        columns: ["org_id","user_id","role"]
+
+- table:
+    schema: public
+    name: workflows
+  select_permissions:
+    - role: owner
+      permission: { columns: "*", filter: { org: { members: { user_id: { _eq: "X-Hasura-User-Id" } } } } }
+    - role: editor
+      permission: { columns: "*", filter: { org: { members: { user_id: { _eq: "X-Hasura-User-Id" } } } } }
+    - role: viewer
+      permission: { columns: "*", filter: { org: { members: { user_id: { _eq: "X-Hasura-User-Id" } } } } }
+  insert_permissions:
+    - role: owner
+      permission:
+        check: { org: { members: { user_id: { _eq: "X-Hasura-User-Id" }, role: { _in: ["owner","editor"] } } } }
+        columns: ["org_id","name","created_by"]
+    - role: editor
+      permission:
+        check: { org: { members: { user_id: { _eq: "X-Hasura-User-Id" }, role: { _in: ["owner","editor"] } } } }
+        columns: ["org_id","name","created_by"]
+  # NOTE: viewer has no insert/update/delete permission entries at all —
+  # absence of a permission = denied by default in Hasura.
+
+- table:
+    schema: public
+    name: workflow_steps
+  select_permissions:
+    - role: owner
+      permission: { columns: "*", filter: { workflow: { org: { members: { user_id: { _eq: "X-Hasura-User-Id" } } } } } }
+    - role: editor
+      permission: { columns: "*", filter: { workflow: { org: { members: { user_id: { _eq: "X-Hasura-User-Id" } } } } } }
+    - role: viewer
+      permission: { columns: "*", filter: { workflow: { org: { members: { user_id: { _eq: "X-Hasura-User-Id" } } } } } }
+  # NOTE: direct insert/update via Hasura is intentionally NOT granted here —
+  # step creation goes through the upsertWorkflowStep Action so Layer 2
+  # (owner-only step types) can be enforced in code. See metadata/actions.yaml.
+
+- table:
+    schema: public
+    name: workflow_triggers
+  select_permissions:
+    - role: owner
+      permission: { columns: "*", filter: { workflow: { org: { members: { user_id: { _eq: "X-Hasura-User-Id" } } } } } }
+    - role: editor
+      permission: { columns: "*", filter: { workflow: { org: { members: { user_id: { _eq: "X-Hasura-User-Id" } } } } } }
+    - role: viewer
+      permission: { columns: "*", filter: { workflow: { org: { members: { user_id: { _eq: "X-Hasura-User-Id" } } } } } }
+  insert_permissions:
+    - role: owner
+      permission:
+        check: { workflow: { org: { members: { user_id: { _eq: "X-Hasura-User-Id" }, role: { _eq: "owner" } } } } }
+        columns: ["workflow_id","type","config"]
+    # editors may only create non-webhook triggers; enforce the type check in
+    # the same upsertWorkflowTrigger Action pattern used for steps if you
+    # want editors to create manual/scheduled triggers via Hasura directly.
+
+- table:
+    schema: public
+    name: workflow_runs
+  select_permissions:
+    - role: owner
+      permission: { columns: "*", filter: { workflow: { org: { members: { user_id: { _eq: "X-Hasura-User-Id" } } } } } }
+    - role: editor
+      permission: { columns: "*", filter: { workflow: { org: { members: { user_id: { _eq: "X-Hasura-User-Id" } } } } } }
+    - role: viewer
+      permission: { columns: "*", filter: { workflow: { org: { members: { user_id: { _eq: "X-Hasura-User-Id" } } } } } }
+  # No client-side insert permission — workflow_runs are only created by the
+  # triggerWorkflowRun Action handler (admin secret), never directly.
+
+- table:
+    schema: public
+    name: step_runs
+  select_permissions:
+    - role: owner
+      permission: { columns: "*", filter: { workflow_run: { workflow: { org: { members: { user_id: { _eq: "X-Hasura-User-Id" } } } } } } }
+    - role: editor
+      permission: { columns: "*", filter: { workflow_run: { workflow: { org: { members: { user_id: { _eq: "X-Hasura-User-Id" } } } } } } }
+    - role: viewer
+      permission: { columns: "*", filter: { workflow_run: { workflow: { org: { members: { user_id: { _eq: "X-Hasura-User-Id" } } } } } } }
+  # Writes only via Action handlers (engine.ts / approveStep.ts using admin
+  # secret) — never exposed to clients directly, since approval is a
+  # business-logic decision, not a plain row update (see Layer 2 in README).
